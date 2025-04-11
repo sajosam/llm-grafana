@@ -4,6 +4,8 @@ import chromadb
 import json
 import os
 from dotenv import load_dotenv
+from urllib.parse import urlparse
+import docker
 
 
 load_dotenv()
@@ -11,6 +13,9 @@ load_dotenv()
 # Get API keys and Grafana key from environment variables
 apikeys = os.getenv("GROQ_API_KEY", "").split(",")
 grafana_key = os.getenv("GRAFANA_KEY")
+# prometheus_host = os.getenv("PROMETHEUS_HOST", "http://localhost")
+prometheus_host = os.getenv("PROMETHEUS_HOST", "http://localhost")
+
 
 # Initialize ChromaDB client
 db = chromadb.PersistentClient(path="./chroma_db")
@@ -19,6 +24,73 @@ collection = db.get_or_create_collection(name="metrics")
 # Initialize session state for metrics labels
 if 'metrics_labels' not in st.session_state:
     st.session_state.metrics_labels = {}
+
+def get_exposed_port(container_name):
+    client = docker.from_env()
+    try:
+        # Get the container by its name
+        container = client.containers.get(container_name)
+    except docker.errors.NotFound:
+        print(f"Container '{container_name}' not found.")
+        return None
+
+    # Retrieve port mapping details from the container's attributes
+    ports = container.attrs['NetworkSettings']['Ports']
+    for container_port, host_bindings in ports.items():
+        if host_bindings:  # Check if port is exposed
+            # Return the first host port found in the bindings
+            return host_bindings[0]['HostPort']
+
+    # If no exposed ports found, return None
+    return None
+
+def adjust_prometheus_url(original_url):
+    """
+    Adjust the Prometheus URL based on environment configuration or via Docker inspection.
+    
+    Steps:
+      1. Parses the original URL (e.g., "https://prometheus:9090") and extracts the hostname
+         to use as the container name.
+      2. Checks for an environment variable `PROMETHEUS_HOST` to override URL details.
+         If defined, it extracts the host (and possibly a port) from it.
+      3. If no environment variable is set, it calls get_exposed_port using the container 
+         name parsed from the original URL to get the actual exposed host port.
+      4. Rebuilds the URL with the new host and port as determined.
+    """
+    original_parsed = urlparse(original_url)
+    # Parse container name from the original URL's hostname
+    container_name = original_parsed.hostname
+
+    # Check for an override using PROMETHEUS_HOST environment variable
+    prometheus_host = os.getenv("PROMETHEUS_HOST", "http://localhost").strip()
+    if prometheus_host:
+        # Determine if PROMETHEUS_HOST includes a scheme
+        if prometheus_host.startswith(('http://', 'https://')):
+            parsed_env = urlparse(prometheus_host)
+            new_host = parsed_env.hostname
+            new_port = get_exposed_port(container_name)
+        else:
+            if ':' in prometheus_host:
+                new_host, port_part = prometheus_host.split(':', 1)
+                new_port = int(port_part) if port_part.isdigit() else None
+            else:
+                new_host = prometheus_host
+                new_port = None
+        # Use new_port if provided, otherwise fall back to the port in the original URL.
+        final_port = new_port or original_parsed.port
+    else:
+        # If no environment override exists, use Docker SDK to inspect the container's port mapping.
+        exposed_port = get_exposed_port(container_name)
+        new_host = container_name  # Keep the container name as the host
+        final_port = exposed_port if exposed_port else original_parsed.port
+
+    # Rebuild the netloc (host:port) portion.
+    if final_port:
+        new_netloc = f"{new_host}:{final_port}"
+    else:
+        new_netloc = new_host
+
+    return original_parsed._replace(netloc=new_netloc).geturl()
 
 def groqrequest(prompt):
     """Send a request to the Groq API using multiple API keys until successful or all fail."""
@@ -71,106 +143,95 @@ def groqrequest(prompt):
     return {"error": "All API keys failed or rate limit reached"}
 
 
-def fetch_metric_labels(metric_name):
-    """Fetch unique labels for a specific metric from Prometheus"""
-    url = f"http://localhost:9090/api/v1/query?query={metric_name}"
+def fetch_metrics(prom_url):
+    """Fetch metrics from specific Prometheus instance"""
     try:
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            labels = set()
-            for result in data.get('data', {}).get('result', []):
-                labels.update(result['metric'].keys())
-            labels.discard("id")
-            return list(labels)
-        return []
+        response = requests.get(f"{prom_url}/api/v1/label/__name__/values", timeout=10)
+        return response.json().get('data', []) if response.ok else []
     except Exception as e:
-        st.error(f"Error fetching labels for {metric_name}: {str(e)}")
+        st.error(f"Metrics fetch failed: {str(e)}")
         return []
 
 
-# Function to fetch metrics from Prometheus
-def fetch_metrics():
-    url = "http://localhost:9090/api/v1/label/__name__/values"
-    response = requests.get(url)
-    if response.status_code == 200:
-        return response.json()['data']
-    else:
-        st.error("Failed to fetch metrics from Prometheus.")
+def store_metrics(metrics, ds_uid):
+    """Store metrics in datasource-specific collection"""
+    collection = db.get_or_create_collection(name=ds_uid)
+    existing = collection.get()['ids']
+    new_metrics = [m for m in metrics if m not in existing]
+    
+    if new_metrics:
+        collection.add(documents=new_metrics, ids=new_metrics)
+    return len(new_metrics)
+
+
+def query_metrics(user_query, ds_uid):
+    """Query datasource-specific collection"""
+    try:
+        collection = db.get_collection(name=ds_uid)
+        results = collection.query(query_texts=[user_query], n_results=5)
+        return results['documents'][0]
+    except Exception as e:
+        st.error(f"Query error: {str(e)}")
         return []
-
-
-# Function to store metrics in ChromaDB
-def store_metrics(metrics):
-    for metric in metrics:
-        collection.add(documents=[metric], ids=[metric])
-    st.success(f"{len(metrics)} metrics stored successfully.")
-
-
-# Function to perform a similarity search in ChromaDB
-def query_metrics(user_query):
-    results = collection.query(query_texts=[user_query], n_results=5)
-    return results['documents'][0] if results['documents'] else []
 
 # Function to generate PromQL query using OpenAI
-def generate_promql_query(user_query, related_metrics):
+def generate_promql_query(user_query_map):
 
-    available_labels = {}
-    for metric in related_metrics:
-        available_labels[metric] = fetch_metric_labels(metric)
     
     prompt = f"""
+        Context:You are generating PromQL queries to retrieve system and application metrics from Prometheus.
 
-        C: Context: You are querying Prometheus metrics to gather system and application performance data.
+        Objective:Create accurate, optimized PromQL queries strictly using the provided input. Prioritize custom metrics and apply only the given labels.
 
-        O: Objective: Generate an accurate PromQL query based on the user's question, taking into account custom metrics if available.
+        Style:lear, minimal, and Prometheus-friendly.
 
-        S: Style: Provide clear and concise responses tailored for Prometheus.
+        Tone:Professional and concise.
 
-        T: Tone: Professional and informative.
+        Audience:Engineers and analysts experienced with Prometheus.
 
-        A: Audience: Data analysts and engineers experienced with Prometheus.
+        Response:Return a valid JSON object only — no extra text or explanation.
 
-        R: Response: Format the output strictly as valid JSON (enclosed in {{}}) without any additional text or explanation.
-        Here is the user's query: {user_query}
+        Input array:  
+        {json.dumps(user_query_map, indent=4)}
 
-        Follow these steps to generate the query:
+        Guidelines:
 
-        1. Carefully analyze the user's question, the context, and any relevant Prometheus schema and rules.
-        2. Determine if the question can be answered using general metrics knowledge (e.g., common CPU, memory, or network metrics).
-        3. If the question seems complicated or involves new concepts, refer to the available custom metrics for guidance.  Use ONLY these available metrics and labels: `{json.dumps(available_labels, indent=4)}`.
-        4. For straightforward or common questions, use your knowledge to generate a general PromQL query.
-        5. Ensure the query is optimized for performance, compatibility with the Prometheus API, and accuracy.
-        6. Strictly return at least one text field (e.g., `instance`) and an `id` field during aggregation/group by operations.
-        7. Do only the task asked and avoid over-explanation or additional operations not requested.
-        8. Use survey answers (if available) for filtering values in the query.
-        9. Never use any labels not explicitly listed above
-        10. Group by existing labels only
-        11. Follow PromQL best practices
-        12. Ensure the query output is formatted as a valid JSON response in the following format:
+        1. For each item:
+        - Use the `mandatory_datasource_uuid` (required).
+        - Use only the `mandatory_similar_metrics`. **Do not use any other metrics.**
+        - Use only the `mandatry_corresponding_metrics_labels`. **Do not add or infer labels.**
+
+        2. Follow PromQL best practices:
+        - Use text-based identifiers (e.g., `instance`, `job`) and include an `id` label when aggregating.
+        - Group only by provided labels.
+        - Ensure performance and correctness.
+
+        3. Format output as:
         {{
-            "explanation": "A brief explanation of how you constructed the query, referencing schemas and rules as necessary.",
-            "query": "The final PromQL query.format should be one of the following[query='query'&time='time' if time else '']",
-            "confidence": 100
+            "result": [
+                {{
+                    "mandatory_datasource_uuid": "value",
+                    "userquery": "value",
+                    "query": "Generated PromQL query"
+                }}
+            ]
         }}
 
-        If the question involves general metrics and you're confident, use your knowledge. If you're confused or dealing with unfamiliar metrics, use the available custom metrics as a reference.
+        Example queries:
 
-        Here are sample user questions and their corresponding PromQL queries for reference:
+        - List all containers:  
+        `"count(container_memory_usage_bytes) by (container_name)"`
 
-        1. List all jobs:
-        query: "sum by (job) (up)"
-        2. List all available containers:
-        query: "count(container_memory_usage_bytes) by (container_name)"
-        3. Which container uses the highest CPU usage (general metric)?
-        query: "topk(1, sum by (container_name) (rate(container_cpu_usage_seconds_total[5m])))"
-        4. Which container is currently using the highest memory (general metric)?
-        query: "topk(1, sum by (container_name) (container_memory_usage_bytes))"
-        5. Which job used the highest memory in the last 1 hour (general metric)?
-        query: "topk(1, avg_over_time(container_memory_usage_bytes[1h]) by (job))"
+        - Highest CPU container:  
+        `"topk(1, sum by (container_name) (rate(container_cpu_usage_seconds_total[5m])))"`
 
+        - Redis clients:  
+        `"redis_connected_clients"`
+
+        - Node CPU:  
+        `"node_cpu_seconds_total"`
     """
-    
+
     result = groqrequest(prompt)
 
     if result.get("error"):
@@ -180,40 +241,32 @@ def generate_promql_query(user_query, related_metrics):
 
 
 def generate_grafana_dashboard(promql_response):
-    """Generate Grafana dashboard JSON from PromQL response"""
-
+    """
+    Generate a Grafana dashboard JSON from the PromQL responses.
+    The promql_response is expected to have the following structure:
+    {
+        "result": [
+            {
+                "datasource_uuid": "...",
+                "userquery": "...",
+                "query": "Generated PromQL query"
+            },
+            ...
+        ]
+    }
+    The dashboard JSON will have one panel per query.
+    """
     prompt = f"""
-    Create Grafana 9.x dashboard JSON for this PromQL query configuration:
+    Create Grafana 9.x dashboard JSON for the following PromQL query configuration:
     {json.dumps(promql_response, indent=2)}
 
     Requirements:
-    1. Use the given base structure for the dashboard JSON:
+    1. Use the following base structure for the dashboard JSON:
     {{
         "title": "Dashboard Title",
         "uid": "unique-dash-uid",
-        "panels": [
-            {{
-                "title": "Panel Title",
-                "type": "[timeseries|piechart|table]",
-                "datasource": {{
-                    "type": "prometheus",
-                    "uid": "P1809F7CD0C75ACF3"
-                }},
-                "targets": [
-                    {{
-                        "expr": "PromQL_query",
-                        "refId": "A",
-                        "format": "time_series",
-                        "legendFormat": "{{{{container_label_name}}}} on {{{{instance}}}}" # use this format for legend
-                    }}
-                ],
-                "gridPos": {{
-                    "h": 8,
-                    "w": 12,
-                    "x": 0,
-                    "y": 0
-                }}
-            }}
+        "panels": [ 
+            // Create one panel for each entry below 
         ],
         "time": {{
             "from": "now-1h",
@@ -224,10 +277,25 @@ def generate_grafana_dashboard(promql_response):
         "version": 1
     }}
 
-    2. Mandatory fields: uid, schemaVersion, version, gridPos for panels
-    3. Use timeseries for line charts, barchart for bar charts
-    4. Keep expr exactly as provided in the query
-    5. Use only datasource UID: P1809F7CD0C75ACF3
+    2. For each object in promql_response["result"], create a panel with:
+       - "title": Use the "userquery" as inspiration for the panel title.
+       - "type": [timeseries|piechart|table|linechart|guage].
+       - "datasource": {{
+             "type": "prometheus",
+             "uid": the value from "datasource_uuid" for that object
+         }}
+       - "targets": An array containing one object with:
+             "expr": the PromQL query from the "query" field,
+             "refId": "A",
+             "format": "[timeseries|piechart|table|linechart|guage]",
+             "legendFormat": "{{{{container_label_name}}}} on {{{{instance}}}}"
+       - "gridPos": Allocate grid positions sequentially for each panel.
+         For example: The first panel at {{"x": 0, "y": 0, "w": 12, "h": 8}},
+         the second at {{"x": 12, "y": 0, "w": 12, "h": 8}}, the third at {{"x": 0, "y": 8, "w": 12, "h": 8}}, etc.
+    
+    3. The output must be a valid JSON object without markdown formatting or additional text.
+    4. Mandatory fields: uid, schemaVersion, version, gridPos for panels
+    5. Keep expr exactly as provided in the query
     6. Set legendFormat in targets using a meaningful label (e.g. container, job, instance, name)
     7. Generate valid JSON without markdown
     8. striclty follows "legendFormat" legend_format = "{{{{container_label_name}}}} on {{{{instance}}}}"
@@ -264,52 +332,109 @@ def apply_grafana_dashboard(dashboard_json):
     except Exception as e:
         return {"error": str(e)}
 
+def fetch_datasources():
+    """Fetch and process Prometheus datasources from Grafana"""
+    url = "http://localhost:3000/api/datasources"
+    headers = {"Authorization": f"Bearer {grafana_key}"}
+    
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            processed_ds = []
+            for ds in response.json():
+                # Only process Prometheus datasources
+                if ds.get('type') == 'prometheus':
+                    # Create a copy to avoid modifying original data
+                    modified_ds = ds.copy()
+                    modified_ds['adjusted_url'] = adjust_prometheus_url(ds.get('url', ''))
+                    processed_ds.append(modified_ds)
+            return processed_ds
+        st.error("Failed to fetch datasources")
+        return []
+    except Exception as e:
+        st.error(f"Datasource error: {str(e)}")
+        return []
+
 
 # Streamlit UI
-st.title("Prometheus Metrics Viewer")
+st.title("Prometheus Metrics Dashboard Builder")
 
-# Navigation links for APIs
-st.markdown("[Go to Streamlit page](http://localhost:8501)")
-st.markdown("[Go to Grafana page](http://localhost:3000)")
-st.markdown("[Go to Prometheus page](http://localhost:9090)")
+datasources = fetch_datasources()
+if not datasources:
+    st.warning("No Prometheus datasources found in Grafana")
+    st.stop()
 
-if st.button("Fetch Metrics"):
-    metrics = fetch_metrics()
-    store_metrics(metrics)
+ds_options = {ds['name']: (ds['uid'], ds['adjusted_url']) for ds in datasources}
 
-user_query = st.text_input("Enter your query (e.g., 'which container utilizes more cpus')")
+with st.expander("Metric Management", expanded=False):
+    if st.button("Refresh All Metrics"):
+        with st.spinner("Updating metrics..."):
+            for ds in datasources:
+                metrics = fetch_metrics(ds['adjusted_url'])
+                if metrics:
+                    count = store_metrics(metrics, ds['uid'])
+                    st.success(f"Updated {ds['name']} with {count} new metrics")
 
-if user_query:
-    related_metrics = query_metrics(user_query)
-    if related_metrics:
-        st.write("Related Metrics:")
-        for metric in related_metrics:
-            st.write(metric)
-        
-        promql_response = generate_promql_query(user_query, related_metrics)
-        
-        # Store the response in session state for later use
-        st.session_state.promql_response = promql_response
-        st.json(promql_response)
+st.header("Create New Dashboard")
+queries = []
 
-        # Dashboard creation section - use a form to prevent rerun
-        with st.form(key='dashboard_form'):
-            if st.form_submit_button("Create Grafana Dashboard"):
-                if 'promql_response' in st.session_state:
-                    dashboard_json = generate_grafana_dashboard(st.session_state.promql_response)
+with st.form("dashboard_form"):
+    for i in range(3):
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            query = st.text_input(f"Query {i+1}", key=f"q{i}")
+        with col2:
+            ds_name = st.selectbox(f"Datasource {i+1}", options=ds_options.keys(), key=f"ds{i}")
+        queries.append((query, ds_name))
+
+
+    if st.form_submit_button("Generate Dashboard"):
+        processed_queries = []
+        for query, ds_name in queries:
+            if query and ds_name:
+                ds_uid, ds_url = ds_options[ds_name]
+                similar = query_metrics(query, ds_uid)
+                labels = {}
+                
+                for metric in similar:
+                    label_res = requests.get(f"{ds_url}/api/v1/query?query={metric}")
+                    if label_res.ok:
+                        # Get the full response data
+                        response_data = label_res.json().get('data', {})
+                        results = response_data.get('result', [])
+
+                        # Check if there are any results before accessing
+                        if results:
+                            # Convert keys to a set, discard "id", then convert back to list
+                            keys = set(results[0].get('metric', {}).keys())
+                            keys.discard("id")
+                            labels[metric] = list(keys)
+                        else:
+                            labels[metric] = []
+                            st.warning(f"No results found for metric: {metric}")
+                
+                processed_queries.append({
+                    "mandatory_datasource_uuid": ds_uid,
+                    "userquery": query,
+                    "mandatory_similar_metrics": similar,
+                    "mandatry_corresponding_metrics_labels": labels
+                })
+
+        if processed_queries:
+            with st.spinner("Generating queries..."):
+                promql_response = generate_promql_query(processed_queries)
+                
+            if not promql_response.get('error'):
+                with st.spinner("Creating dashboard..."):
+                    dashboard_json = generate_grafana_dashboard(promql_response)
                     
-                    if dashboard_json:
-                        st.subheader("Generated Dashboard")
-                        st.json(dashboard_json)
-                        st.session_state.dashboard_json = dashboard_json
+                if not dashboard_json.get('error'):
+                    apply_response = apply_grafana_dashboard(dashboard_json)
+                    if 'url' in apply_response:
+                        st.success(f"Dashboard created: [View Dashboard]({apply_response['url']})")
                     else:
-                        st.error("Failed to generate dashboard JSON")
-            
-            # Apply to Grafana
-            if 'dashboard_json' in st.session_state:
-                response = apply_grafana_dashboard(st.session_state.dashboard_json)
-                if response.get("error"):
-                    st.error(f"Failed to apply dashboard: {response.get('error')}")
+                        st.error("Failed to deploy dashboard")
                 else:
-                    st.success(f"Dashboard applied successfully. Access it at {response['url']}")
-
+                    st.error("Dashboard generation failed")
+            else:
+                st.error("Query generation failed")
